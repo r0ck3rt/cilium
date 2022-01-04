@@ -168,7 +168,7 @@ cilium-agent [flags]
       --ipsec-key-file string                                Path to IPSec key file
       --iptables-lock-timeout duration                       Time to pass to each iptables invocation to wait for xtables lock acquisition (default 5s)
       --iptables-random-fully                                Set iptables flag random-fully on masquerading rules
-      --ipv4-native-routing-cidr string                      Allows to explicitly specify the IPv4 CIDR for native routing. This value corresponds to the configured cluster-cidr.
+      --ipv4-native-routing-cidr string                      Allows to explicitly specify the IPv4 CIDR for native routing.When specified, Cilium assumes something else has configured the networking for this range and will hand traffic destined to that range to the Linux network stack without applying any SNAT. The network stack will then be responsible for routing it to its destination, potentially with any NAT applied if necessary. Moreover, if the Kubernetes cluster CIDR is included in the native routing CIDR, the user must configure the routes to reach pods, either manually or by setting the auto-direct-node-routes flag.
       --ipv4-node string                                     IPv4 address of node (default "auto")
       --ipv4-pod-subnets strings                             List of IPv4 pod subnets to preconfigure for encryption
       --ipv4-range string                                    Per-node IPv4 endpoint prefix, e.g. 10.16.0.0/16 (default "auto")

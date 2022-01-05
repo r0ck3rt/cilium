@@ -2687,6 +2687,10 @@ func (c *DaemonConfig) Populate() {
 		}
 	}
 
+	if nativeRoutingCIDR == "" && ipv4NativeRoutingCIDR == "" && c.EnableAutoDirectRouting {
+		log.Warnf("%s will be ineffective since %s is not set", EnableAutoDirectRoutingName, IPv4NativeRoutingCIDR)
+	}
+
 	ipv6NativeRoutingCIDR := viper.GetString(IPv6NativeRoutingCIDR)
 
 	if ipv6NativeRoutingCIDR != "" {

@@ -75,7 +75,7 @@ union tcp_flags {
  * - Zero if this flow was recently monitored.
  * - Non-zero if this flow has not been monitored recently.
  */
-static __always_inline __u32 __ct_update_timeout(struct ct_entry *entry,
+static __always_inline __u32 __ct_update_stats(struct ct_entry *entry,
 						 __u32 lifetime, int dir,
 						 union tcp_flags flags,
 						 __u8 report_mask)
@@ -85,9 +85,6 @@ static __always_inline __u32 __ct_update_timeout(struct ct_entry *entry,
 	__u8 seen_flags = flags.lower_bits & report_mask;
 	__u32 last_report;
 
-#ifdef NEEDS_TIMEOUT
-	WRITE_ONCE(entry->lifetime, now + lifetime);
-#endif
 	if (dir == CT_INGRESS) {
 		accumulated_flags = READ_ONCE(entry->rx_flags_seen);
 		last_report = READ_ONCE(entry->last_rx_report);
@@ -139,6 +136,7 @@ static __always_inline __u32 __ct_update_timeout(struct ct_entry *entry,
 		}
 		return TRACE_PAYLOAD_LEN;
 	}
+
 	return 0;
 }
 
@@ -150,7 +148,8 @@ static __always_inline __u32 __ct_update_timeout(struct ct_entry *entry,
  */
 static __always_inline __u32 ct_update_timeout(struct ct_entry *entry,
 					       bool tcp, int dir,
-					       union tcp_flags seen_flags)
+					       union tcp_flags seen_flags,
+					       const bool set_stats)
 {
 	__u32 lifetime = dir == CT_SERVICE ?
 			 bpf_sec_to_mono(CT_SERVICE_LIFETIME_NONTCP) :
@@ -168,8 +167,14 @@ static __always_inline __u32 ct_update_timeout(struct ct_entry *entry,
 		}
 	}
 
-	return __ct_update_timeout(entry, lifetime, dir, seen_flags,
-				   CT_REPORT_FLAGS);
+#ifdef NEEDS_TIMEOUT
+	WRITE_ONCE(entry->lifetime, now + lifetime);
+#endif
+
+	if (set_stats)
+		return __ct_update_stats(entry, lifetime, dir, seen_flags,
+					   CT_REPORT_FLAGS);
+	return 0;
 }
 
 static __always_inline void ct_reset_closing(struct ct_entry *entry)
@@ -212,7 +217,7 @@ static __always_inline __u8 __ct_lookup(const void *map, struct __ctx_buff *ctx,
 					const void *tuple, int action, int dir,
 					struct ct_state *ct_state,
 					bool is_tcp, union tcp_flags seen_flags,
-					__u32 *monitor)
+					const bool set_stats, __u32 *monitor)
 {
 	struct ct_entry *entry;
 	int reopen;
@@ -223,7 +228,8 @@ static __always_inline __u8 __ct_lookup(const void *map, struct __ctx_buff *ctx,
 	if (entry) {
 		cilium_dbg(ctx, DBG_CT_MATCH, entry->lifetime, entry->rev_nat_index);
 		if (ct_entry_alive(entry))
-			*monitor = ct_update_timeout(entry, is_tcp, dir, seen_flags);
+			*monitor = ct_update_timeout(entry, is_tcp, dir,
+						     seen_flags, set_stats);
 		if (ct_state) {
 			ct_state->rev_nat_index = entry->rev_nat_index;
 			ct_state->loopback = entry->lb_loopback;
@@ -242,21 +248,28 @@ static __always_inline __u8 __ct_lookup(const void *map, struct __ctx_buff *ctx,
 #endif
 #ifdef CONNTRACK_ACCOUNTING
 		/* FIXME: This is slow, per-cpu counters? */
-		if (dir == CT_INGRESS) {
-			__sync_fetch_and_add(&entry->rx_packets, 1);
-			__sync_fetch_and_add(&entry->rx_bytes, ctx_full_len(ctx));
-		} else if (dir == CT_EGRESS) {
-			__sync_fetch_and_add(&entry->tx_packets, 1);
-			__sync_fetch_and_add(&entry->tx_bytes, ctx_full_len(ctx));
+		if (set_stats) {
+			if (dir == CT_INGRESS) {
+				__sync_fetch_and_add(&entry->rx_packets, 1);
+				__sync_fetch_and_add(&entry->rx_bytes,
+						     ctx_full_len(ctx));
+			} else if (dir == CT_EGRESS) {
+				__sync_fetch_and_add(&entry->tx_packets, 1);
+				__sync_fetch_and_add(&entry->tx_bytes,
+						     ctx_full_len(ctx));
+			}
 		}
 #endif
+
 		switch (action) {
 		case ACTION_CREATE:
 			reopen = entry->rx_closing | entry->tx_closing;
 			reopen |= seen_flags.value & TCP_FLAG_SYN;
 			if (unlikely(reopen == (TCP_FLAG_SYN|0x1))) {
 				ct_reset_closing(entry);
-				*monitor = ct_update_timeout(entry, is_tcp, dir, seen_flags);
+				*monitor = ct_update_timeout(entry, is_tcp, dir,
+							     seen_flags,
+							     set_stats);
 				return CT_REOPENED;
 			}
 			break;
@@ -281,8 +294,8 @@ static __always_inline __u8 __ct_lookup(const void *map, struct __ctx_buff *ctx,
 			*monitor = TRACE_PAYLOAD_LEN;
 			if (ct_entry_alive(entry))
 				break;
-			__ct_update_timeout(entry, bpf_sec_to_mono(CT_CLOSE_TIMEOUT),
-					    dir, seen_flags, CT_REPORT_FLAGS);
+			__ct_update_stats(entry, bpf_sec_to_mono(CT_CLOSE_TIMEOUT),
+					  dir, seen_flags, CT_REPORT_FLAGS);
 			break;
 		}
 
@@ -942,7 +955,8 @@ static __always_inline int ct_create4(const void *map_main,
 				      struct ipv4_ct_tuple *tuple,
 				      struct __ctx_buff *ctx, const int dir,
 				      const struct ct_state *ct_state,
-				      bool proxy_redirect)
+				      bool proxy_redirect,
+				      const bool set_stats)
 {
 	/* Create entry in original direction */
 	struct ct_entry entry = { };
@@ -963,15 +977,19 @@ static __always_inline int ct_create4(const void *map_main,
 	if (dir == CT_SERVICE)
 		entry.backend_id = ct_state->backend_id;
 	entry.rev_nat_index = ct_state->rev_nat_index;
-	seen_flags.value |= is_tcp ? TCP_FLAG_SYN : 0;
-	ct_update_timeout(&entry, is_tcp, dir, seen_flags);
 
-	if (dir == CT_INGRESS) {
-		entry.rx_packets = 1;
-		entry.rx_bytes = ctx_full_len(ctx);
-	} else if (dir == CT_EGRESS) {
-		entry.tx_packets = 1;
-		entry.tx_bytes = ctx_full_len(ctx);
+        if (set_stats) {
+		seen_flags.value |= is_tcp ? TCP_FLAG_SYN : 0;
+
+		ct_update_timeout(&entry, is_tcp, dir, seen_flags);
+
+		if (dir == CT_INGRESS) {
+			entry.rx_packets = 1;
+			entry.rx_bytes = ctx_full_len(ctx);
+		} else if (dir == CT_EGRESS) {
+			entry.tx_packets = 1;
+			entry.tx_bytes = ctx_full_len(ctx);
+		}
 	}
 
 #ifdef ENABLE_NAT46
@@ -1131,7 +1149,8 @@ ct_create4(const void *map_main __maybe_unused,
 	   struct ipv4_ct_tuple *tuple __maybe_unused,
 	   struct __ctx_buff *ctx __maybe_unused, const int dir __maybe_unused,
 	   const struct ct_state *ct_state __maybe_unused,
-	   bool proxy_redirect __maybe_unused)
+	   bool proxy_redirect __maybe_unused,
+	   const bool set_stats __maybe_unused)
 {
 	return 0;
 }

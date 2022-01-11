@@ -288,7 +288,7 @@ static __always_inline int snat_v4_track_local(struct __ctx_buff *ctx,
 		return ret;
 	} else if (ret == CT_NEW) {
 		ret = ct_create4(get_ct_map4(&tmp), NULL, &tmp, ctx,
-				 where, &ct_state, false);
+				 where, &ct_state, false, true);
 		if (IS_ERR(ret))
 			return ret;
 	}
